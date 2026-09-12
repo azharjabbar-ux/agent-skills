@@ -115,6 +115,29 @@
   #send:hover:not(:disabled){transform:scale(1.07)}
   #send:disabled{opacity:.42;cursor:not-allowed}
 
+  /* ---------- voice ---------- */
+  #status{display:flex;align-items:center;gap:8px;margin:0 0 9px 6px;min-height:16px;
+          font-size:11.5px;letter-spacing:.08em;color:var(--dim);transition:color .25s}
+  #status .dot{width:7px;height:7px;border-radius:50%;background:#4b5466;flex:none;transition:all .25s}
+  #status .heard{color:#c6cfe4;font-style:italic;letter-spacing:0;opacity:.9}
+  #status.listening{color:#fca5a5}
+  #status.listening .dot{background:#f87171;box-shadow:0 0 9px #f87171;animation:throb 1.2s ease-in-out infinite}
+  #status.thinking{color:#fbbf24}
+  #status.thinking .dot{background:#fbbf24;box-shadow:0 0 9px #fbbf24;animation:throb 1.2s ease-in-out infinite}
+  #status.speaking{color:#7dd3fc}
+  #status.speaking .dot{background:#7dd3fc;box-shadow:0 0 9px #7dd3fc;animation:throb 1.2s ease-in-out infinite}
+  #status.muted .dot{background:#4b5466;box-shadow:none}
+  @keyframes throb{0%,100%{opacity:1}50%{opacity:.3}}
+
+  #mic{flex:none;width:38px;height:38px;border-radius:50%;cursor:pointer;
+       background:rgba(255,255,255,.05);border:1px solid var(--edge);color:var(--dim);
+       display:grid;place-items:center;transition:background .2s,color .2s,border-color .2s}
+  #mic:hover:not(:disabled){background:rgba(255,255,255,.13);color:var(--ink)}
+  #mic.on{background:rgba(248,113,113,.16);border-color:rgba(248,113,113,.5);color:#fca5a5;
+          animation:miclive 1.5s ease-in-out infinite}
+  #mic:disabled{opacity:.3;cursor:not-allowed}
+  @keyframes miclive{0%,100%{box-shadow:0 0 0 0 rgba(248,113,113,.35)}50%{box-shadow:0 0 0 7px rgba(248,113,113,0)}}
+
   @media (max-width:640px){
     #legend{display:none}
     #panel{width:100%}
@@ -154,8 +177,19 @@
 
 <div id="chat">
   <div id="answer"></div>
+  <div id="status" role="status" aria-live="polite">
+    <span class="dot"></span><span id="statustext">Ready</span>
+  </div>
   <form id="bar" autocomplete="off">
     <input id="q" placeholder="Ask your notes anything&hellip;" aria-label="Ask your notes">
+    <button id="mic" type="button" title="Speak your question" aria-label="Speak your question">
+      <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="9" y="3" width="6" height="11" rx="3"></rect>
+        <path d="M5 11a7 7 0 0 0 14 0"></path>
+        <line x1="12" y1="18" x2="12" y2="21"></line>
+      </svg>
+    </button>
     <button id="send" type="submit" title="Send">&#8593;</button>
   </form>
 </div>

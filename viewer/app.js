@@ -2,6 +2,27 @@
 (function () {
   'use strict';
 
+  /* =====================================================================
+     FINISH_MS -- the most personal number in this build.
+
+     Speech recognition finalises a phrase every time you pause, and people
+     pause mid-sentence. This is how long a silence has to last before the
+     galaxy decides you have actually finished talking. Fragments that land
+     inside the window are glued together and sent as one question.
+
+       too low   -> you get cut off mid-thought and ask half a question
+       too high  -> the galaxy feels slow to answer
+
+     Start at 900. After a day of real use, tune it here. You can also try
+     values live from the console without editing this file:
+         __galaxy.voice.setFinishMs(1200)
+     ===================================================================== */
+  var FINISH_MS = 900;
+
+  // Said on their own, these never wait for the finish window -- they cut in
+  // immediately and stop whatever is being spoken.
+  var INTERRUPT_WORDS = ['stop', 'wait', 'cancel', 'quiet', 'shush', 'hold on', 'never mind'];
+
   var boot = document.getElementById('boot');
   var booterr = document.getElementById('booterr');
 
@@ -373,14 +394,16 @@
     });
   }
 
-  form.addEventListener('submit', function (e) {
-    e.preventDefault();
-    var q = input.value.trim();
-    if (!q) return;
+  // One path in. Typing and speaking both land here.
+  function ask(q) {
+    q = String(q || '').trim();
+    if (!q || sendBtn.disabled) return;
+    input.value = q;
     sendBtn.disabled = true;
+    setStatus('thinking');
     showAnswer('<span class="dots"><i></i><i></i><i></i></span>', false);
 
-    fetch('/chat', {
+    return fetch('/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ question: q })
@@ -391,7 +414,9 @@
       })
       .then(function (res) {
         if (!res.ok || res.body.error) {
-          showAnswer(esc(res.body.error || 'Request failed.'), true);
+          var msg = res.body.error || 'Request failed.';
+          showAnswer(esc(msg), true);
+          speak(msg);          // silence would be worse than bad news, hands-free
           return;
         }
         var ids = (res.body.nodes || []).filter(function (i) { return byId[i]; });
@@ -411,15 +436,271 @@
         Array.prototype.forEach.call(answer.querySelectorAll('.cites button'), function (b) {
           b.onclick = function () { select(parseInt(b.dataset.id, 10), true); };
         });
+
+        speak(res.body.answer || '');
       })
       .catch(function (err) {
-        showAnswer('Could not reach the server: ' + esc(err.message), true);
+        var msg = 'Could not reach the server: ' + err.message;
+        showAnswer(esc(msg), true);
+        speak(msg);
       })
       .then(function () {
         sendBtn.disabled = false;
         input.select();
+        if (!speaking) setStatus(listening ? 'listening' : 'idle');
       });
+  }
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    ask(input.value);
   });
+
+  // ----------------------------------------------------------------- voice
+  // ?mute=1 is read once, here, and enforced in exactly one place: speak().
+  var MUTED = (function () {
+    try { return new URLSearchParams(location.search).get('mute') === '1'; }
+    catch (e) { return /[?&]mute=1(?:&|$)/.test(location.search); }
+  })();
+
+  var statusEl = document.getElementById('status');
+  var statusText = document.getElementById('statustext');
+  var micBtn = document.getElementById('mic');
+
+  var synth = window.speechSynthesis || null;
+  var voices = [], chosenVoice = null;
+  var audioUnlocked = false;      // nothing speaks before the first gesture
+  var speaking = false;
+
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition || null;
+  var recog = null;
+  var listening = false;          // mic is actually running
+  var wantListening = false;      // user wants the mic on
+  var pausedForSpeech = false;    // we stopped the mic so it can't hear the voice
+
+  var buffer = '';                // spoken fragments waiting on the finish window
+  var finishTimer = null;
+
+  function setStatus(state, detail) {
+    if (!statusEl) return;
+    statusEl.className = state === 'idle' ? (MUTED ? 'muted' : '') : state;
+    var label = { listening: 'Listening', thinking: 'Thinking', speaking: 'Speaking' }[state]
+             || (MUTED ? 'Ready · muted' : 'Ready');
+    statusText.innerHTML = detail
+      ? label + ' <span class="heard">“' + detail.replace(/[<&]/g, '') + '”</span>'
+      : label;
+  }
+
+  // ---- speaking --------------------------------------------------------
+  function pickVoice(list) {
+    if (!list || !list.length) return null;
+    var gb = list.filter(function (v) { return /^en[-_]GB/i.test(v.lang); });
+    if (gb.length) {
+      // Prefer the natural-sounding British voices when the system has them.
+      var liked = ['Daniel', 'Google UK English Female', 'Google UK English Male',
+                   'Sonia', 'Libby', 'Ryan', 'Serena', 'Kate', 'Oliver', 'Arthur'];
+      for (var i = 0; i < liked.length; i++) {
+        var hit = gb.filter(function (v) { return v.name.indexOf(liked[i]) !== -1; })[0];
+        if (hit) return hit;
+      }
+      return gb[0];
+    }
+    var en = list.filter(function (v) { return /^en/i.test(v.lang); });
+    return en[0] || list[0] || null;
+  }
+
+  function loadVoices() {
+    if (!synth) return;
+    voices = synth.getVoices() || [];
+    if (voices.length) chosenVoice = pickVoice(voices);
+  }
+  if (synth) {
+    loadVoices();
+    if (typeof synth.addEventListener === 'function') {
+      synth.addEventListener('voiceschanged', loadVoices);
+    } else { synth.onvoiceschanged = loadVoices; }
+  }
+
+  // Browsers refuse speech until the user has interacted. Spend the very first
+  // gesture on a silent utterance so the first real line speaks immediately.
+  function unlockAudio() {
+    if (audioUnlocked || !synth) return;
+    audioUnlocked = true;
+    loadVoices();
+    try {
+      var warm = new SpeechSynthesisUtterance(' ');
+      warm.volume = 0;
+      synth.speak(warm);
+    } catch (e) { /* unlocked anyway; the next speak() will tell us */ }
+  }
+  ['pointerdown', 'keydown', 'touchstart'].forEach(function (ev) {
+    window.addEventListener(ev, unlockAudio, { capture: true });
+  });
+
+  /* THE one function that ever produces sound. ?mute=1 stops here, so there is
+     no other route to the speakers to forget about. */
+  function speak(text) {
+    if (MUTED) return;                       // <- the whole mute contract
+    if (!synth || !audioUnlocked) return;    // never before the first gesture
+    text = String(text || '').trim();
+    if (!text) return;
+
+    try { synth.cancel(); } catch (e) {}
+    var u = new SpeechSynthesisUtterance(text);
+    if (!chosenVoice) loadVoices();
+    // A bad voice handle must never cost us the whole answer -- fall back to
+    // asking for en-GB by language and let the browser choose.
+    u.lang = (chosenVoice && chosenVoice.lang) || 'en-GB';
+    if (chosenVoice) {
+      try { u.voice = chosenVoice; } catch (e) { u.lang = 'en-GB'; }
+    }
+    u.rate = 1; u.pitch = 1; u.volume = 1;
+
+    u.onstart = function () {
+      speaking = true;
+      setStatus('speaking');
+      muteMicWhileSpeaking();
+    };
+    var done = function () {
+      speaking = false;
+      unmuteMicAfterSpeaking();
+      setStatus(listening || wantListening ? 'listening' : 'idle');
+    };
+    u.onend = done;
+    u.onerror = done;
+    try { synth.speak(u); } catch (e) { done(); }
+  }
+
+  // ---- the finish window ----------------------------------------------
+  function isInterrupt(text) {
+    var t = String(text).toLowerCase().replace(/[^a-z\s]/g, '').replace(/\s+/g, ' ').trim();
+    return INTERRUPT_WORDS.indexOf(t) !== -1;
+  }
+
+  function interrupt() {
+    clearTimeout(finishTimer); finishTimer = null;
+    buffer = '';
+    try { if (synth) synth.cancel(); } catch (e) {}
+    speaking = false;
+    unmuteMicAfterSpeaking();
+    setStatus(listening || wantListening ? 'listening' : 'idle', 'interrupted');
+  }
+
+  /* Every finalised phrase arrives here. A pause inside FINISH_MS is treated as
+     a breath, not the end of a thought: the fragment is appended and the clock
+     restarts. Only the pause that outlasts FINISH_MS sends the whole sentence. */
+  function onFinal(text) {
+    text = String(text || '').trim();
+    if (!text) return;
+
+    if (isInterrupt(text)) { interrupt(); return; }   // never buffered
+
+    buffer = buffer ? buffer + ' ' + text : text;
+    setStatus('listening', buffer);
+    clearTimeout(finishTimer);
+    finishTimer = setTimeout(flushBuffer, FINISH_MS);
+  }
+
+  function flushBuffer() {
+    finishTimer = null;
+    var q = buffer.trim();
+    buffer = '';
+    if (q) ask(q);
+  }
+
+  // ---- listening -------------------------------------------------------
+  function muteMicWhileSpeaking() {
+    if (listening && recog) {
+      pausedForSpeech = true;
+      try { recog.stop(); } catch (e) {}
+    }
+  }
+  function unmuteMicAfterSpeaking() {
+    if (!pausedForSpeech) return;
+    pausedForSpeech = false;
+    if (wantListening && recog) {
+      try { recog.start(); } catch (e) {}
+    }
+  }
+
+  function buildRecognition() {
+    if (!SR) return null;
+    var r = new SR();
+    r.continuous = true;        // keep the session open across pauses
+    r.interimResults = true;    // so the status line can show you being heard
+    r.lang = 'en-GB';
+    r.maxAlternatives = 1;
+
+    r.onstart = function () {
+      listening = true;
+      micBtn.classList.add('on');
+      if (!speaking) setStatus('listening', buffer || '');
+    };
+
+    r.onresult = function (ev) {
+      var interim = '';
+      for (var i = ev.resultIndex; i < ev.results.length; i++) {
+        var res = ev.results[i];
+        var txt = res[0] ? res[0].transcript : '';
+        if (res.isFinal) onFinal(txt);
+        else interim += txt;
+      }
+      if (interim.trim() && !speaking) {
+        setStatus('listening', (buffer ? buffer + ' ' : '') + interim.trim());
+      }
+    };
+
+    r.onerror = function (ev) {
+      if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
+        wantListening = false;
+        micBtn.classList.remove('on');
+        showAnswer('Microphone blocked. Allow mic access for this page, then click the mic again.', true);
+      } else if (ev.error === 'no-speech') {
+        return;   // harmless; onend restarts us
+      }
+    };
+
+    r.onend = function () {
+      listening = false;
+      micBtn.classList.remove('on');
+      if (wantListening && !pausedForSpeech) {
+        // Chrome ends the session on its own; keep the mic alive.
+        try { r.start(); } catch (e) {}
+      } else if (!wantListening) {
+        // Whatever was still buffered when you switched the mic off still counts.
+        if (finishTimer) { clearTimeout(finishTimer); finishTimer = null; flushBuffer(); }
+        if (!speaking) setStatus('idle');
+      }
+    };
+    return r;
+  }
+
+  function startListening() {
+    if (!recog) recog = buildRecognition();
+    if (!recog) return;
+    wantListening = true;
+    micBtn.classList.add('on');
+    try { recog.start(); } catch (e) { /* already running */ }
+  }
+
+  function stopListening() {
+    wantListening = false;
+    micBtn.classList.remove('on');
+    if (recog) { try { recog.stop(); } catch (e) {} }
+    else if (finishTimer) { clearTimeout(finishTimer); finishTimer = null; flushBuffer(); }
+  }
+
+  if (!SR) {
+    micBtn.disabled = true;
+    micBtn.title = 'This browser has no webkitSpeechRecognition - try Chrome or Edge';
+  } else {
+    micBtn.addEventListener('click', function () {
+      if (speaking) { interrupt(); return; }      // click while talking = barge in
+      if (wantListening) stopListening(); else startListening();
+    });
+  }
+
+  setStatus('idle');
 
   // ------------------------------------------------------------------ boot
   // Frame the dense core rather than the full bounding sphere: a handful of
@@ -457,5 +738,26 @@
   setTimeout(frame, 7000);
   requestAnimationFrame(tick);
 
-  window.__galaxy = { graph: graph, select: select, groups: groups };
+  window.__galaxy = {
+    graph: graph, select: select, groups: groups,
+    voice: {
+      get FINISH_MS() { return FINISH_MS; },
+      setFinishMs: function (ms) { FINISH_MS = Math.max(0, ms | 0); return FINISH_MS; },
+      muted: MUTED,
+      interruptWords: INTERRUPT_WORDS,
+      feedFinal: onFinal,                                  // drive the buffer directly
+      peekBuffer: function () { return buffer; },
+      pending: function () { return finishTimer !== null; },
+      speak: speak,
+      unlock: unlockAudio,
+      isUnlocked: function () { return audioUnlocked; },
+      hasRecognition: !!SR,
+      voiceName: function () {
+        return chosenVoice ? chosenVoice.name + ' (' + chosenVoice.lang + ')' : null;
+      },
+      listVoices: function () {
+        return (voices || []).map(function (v) { return v.name + ' | ' + v.lang; });
+      }
+    }
+  };
 })();
