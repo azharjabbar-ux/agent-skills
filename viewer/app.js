@@ -1,0 +1,461 @@
+/* Knowledge Galaxy - viewer logic. No framework, no build step. */
+(function () {
+  'use strict';
+
+  var boot = document.getElementById('boot');
+  var booterr = document.getElementById('booterr');
+
+  function fail(msg) {
+    boot.classList.remove('gone');
+    booterr.innerHTML = msg;
+    var b = boot.querySelector('.bar'); if (b) b.style.display = 'none';
+    var h = boot.querySelector('h1'); if (h) h.textContent = 'Cannot render';
+  }
+
+  if (typeof ForceGraph3D === 'undefined') {
+    return fail('The 3d-force-graph library did not load.<br>Check your connection, or make sure <code>viewer/vendor/3d-force-graph.min.js</code> exists.');
+  }
+  if (typeof GRAPH === 'undefined' || !GRAPH.nodes || !GRAPH.nodes.length) {
+    return fail('No graph data found.<br>Run <code>python3 build.py</code> to generate <code>viewer/graph-data.js</code>, then reload.');
+  }
+
+  // ---------------------------------------------------------------- palette
+  // Consecutive entries are far apart in hue, so neighbouring groups in the
+  // sorted list never end up looking like each other.
+  var PALETTE = ['#7dd3fc','#fbbf24','#34d399','#f472b6','#c4b5fd',
+                 '#fb923c','#22d3ee','#a3e635','#f87171','#e879f9'];
+  var groups = [];
+  GRAPH.nodes.forEach(function (n) {
+    if (groups.indexOf(n.group) === -1) groups.push(n.group);
+  });
+  groups.sort();
+  var colorOf = {};
+  groups.forEach(function (g, i) { colorOf[g] = PALETTE[i % PALETTE.length]; });
+  function nodeColor(n) { return colorOf[n.group] || '#9aa4bd'; }
+
+  // hex -> "r,g,b"
+  var rgbCache = {};
+  function rgb(hex) {
+    if (rgbCache[hex]) return rgbCache[hex];
+    var v = parseInt(hex.slice(1), 16);
+    return (rgbCache[hex] = [(v >> 16) & 255, (v >> 8) & 255, v & 255].join(','));
+  }
+
+  // ---------------------------------------------------------- adjacency map
+  var byId = {};
+  GRAPH.nodes.forEach(function (n) { byId[n.id] = n; });
+  var neighbours = {};
+  GRAPH.nodes.forEach(function (n) { neighbours[n.id] = []; });
+  GRAPH.links.forEach(function (l) {
+    var s = typeof l.source === 'object' ? l.source.id : l.source;
+    var t = typeof l.target === 'object' ? l.target.id : l.target;
+    if (neighbours[s] && neighbours[s].indexOf(t) === -1) neighbours[s].push(t);
+    if (neighbours[t] && neighbours[t].indexOf(s) === -1) neighbours[t].push(s);
+  });
+
+  var focused = null;         // currently selected node id (or null)
+  var lit = {};               // id -> true for focused node + neighbours
+  var citedIds = [];          // node ids the brain cited
+
+  function isLit(id) { return lit[id] === true; }
+  function anyLit() { return focused !== null || citedIds.length > 0; }
+
+  function recomputeLit() {
+    lit = {};
+    if (focused !== null) {
+      lit[focused] = true;
+      neighbours[focused].forEach(function (id) { lit[id] = true; });
+    }
+    citedIds.forEach(function (id) { lit[id] = true; });
+  }
+
+  // ------------------------------------------------------------------ graph
+  var el = document.getElementById('graph');
+  var graph = ForceGraph3D()(el)
+    .graphData({
+      nodes: GRAPH.nodes.map(function (n) { return Object.assign({}, n); }),
+      links: GRAPH.links.map(function (l) { return Object.assign({}, l); })
+    })
+    .backgroundColor('rgba(0,0,0,0)')
+    .showNavInfo(false)
+    .nodeId('id')
+    .nodeLabel(function (n) { return n.label; })
+    .nodeVal(function (n) { return 1.6 + (n.degree || 0) * 0.22; })
+    .nodeRelSize(3.8)
+    .nodeResolution(18)
+    .nodeOpacity(0.96)
+    .nodeColor(function (n) {
+      var c = nodeColor(n);
+      if (!anyLit()) return c;
+      return isLit(n.id) ? c : 'rgba(' + rgb(c) + ',0.16)';
+    })
+    .linkColor(function (l) {
+      var s = typeof l.source === 'object' ? l.source.id : l.source;
+      var t = typeof l.target === 'object' ? l.target.id : l.target;
+      if (!anyLit()) return 'rgba(150,175,225,0.17)';
+      return (isLit(s) && isLit(t)) ? 'rgba(190,225,255,0.62)' : 'rgba(140,165,210,0.03)';
+    })
+    .linkWidth(function (l) {
+      var s = typeof l.source === 'object' ? l.source.id : l.source;
+      var t = typeof l.target === 'object' ? l.target.id : l.target;
+      return (anyLit() && isLit(s) && isLit(t)) ? 0.9 : 0.28;
+    })
+    .linkOpacity(0.5)
+    .warmupTicks(60)
+    .cooldownTicks(220)
+    .onNodeClick(function (n) { select(n.id, true); })
+    .onBackgroundClick(function () { clearFocus(); });
+
+  // Cap how far repulsion reaches, otherwise weakly-linked notes get flung out
+  // and the dense core reads as a distant speck.
+  graph.d3Force('charge').strength(-90).distanceMax(260);
+  if (graph.d3Force('link')) graph.d3Force('link').distance(36);
+  if (graph.d3Force('center') && graph.d3Force('center').strength) {
+    graph.d3Force('center').strength(1);
+  }
+
+  function refresh() {
+    graph.nodeColor(graph.nodeColor())
+         .linkColor(graph.linkColor())
+         .linkWidth(graph.linkWidth());
+  }
+
+  // --------------------------------------------------------------- controls
+  var controls = graph.controls();
+  var idle = true, idleTimer = null;
+
+  function nudgeIdle() {
+    idle = false;
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(function () { if (focused === null) idle = true; }, 4200);
+  }
+  ['mousedown', 'wheel', 'touchstart'].forEach(function (ev) {
+    el.addEventListener(ev, nudgeIdle, { passive: true });
+  });
+
+  // -------------------------------------------------------------- starfield
+  var starCv = document.getElementById('stars'), sctx = starCv.getContext('2d');
+  var glowCv = document.getElementById('glow'), gctx = glowCv.getContext('2d');
+  var W = 0, H = 0, DPR = Math.min(window.devicePixelRatio || 1, 2);
+  var stars = [];
+
+  function seedStars() {
+    stars = [];
+    var count = Math.round(Math.min(900, Math.max(340, (W * H) / 2600)));
+    for (var i = 0; i < count; i++) {
+      var layer = i % 3;
+      stars.push({
+        u: Math.random(), v: Math.random(), layer: layer,
+        r: (layer === 0 ? 0.45 : layer === 1 ? 0.8 : 1.25) * (0.6 + Math.random() * 0.9),
+        a: (layer === 0 ? 0.3 : layer === 1 ? 0.52 : 0.8) * (0.45 + Math.random() * 0.55),
+        ph: Math.random() * Math.PI * 2,
+        tw: 0.4 + Math.random() * 1.5
+      });
+    }
+  }
+
+  function resize() {
+    W = window.innerWidth; H = window.innerHeight;
+    [starCv, glowCv].forEach(function (c) {
+      c.width = Math.round(W * DPR); c.height = Math.round(H * DPR);
+      c.style.width = W + 'px'; c.style.height = H + 'px';
+      c.getContext('2d').setTransform(DPR, 0, 0, DPR, 0, 0);
+    });
+    seedStars();
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  function drawStars(t, cam) {
+    sctx.clearRect(0, 0, W, H);
+    // deep-space wash
+    var g = sctx.createRadialGradient(W * 0.5, H * 0.48, 0, W * 0.5, H * 0.48, Math.max(W, H) * 0.75);
+    g.addColorStop(0, 'rgba(24,34,66,0.5)');
+    g.addColorStop(0.45, 'rgba(10,14,32,0.32)');
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    sctx.fillStyle = g; sctx.fillRect(0, 0, W, H);
+
+    var az = Math.atan2(cam.x, cam.z) / (Math.PI * 2);
+    var elv = Math.atan2(cam.y, Math.hypot(cam.x, cam.z) || 1) / Math.PI;
+
+    for (var i = 0; i < stars.length; i++) {
+      var s = stars[i];
+      var depth = 0.25 + s.layer * 0.42;             // nearer layers move more
+      var x = (((s.u - az * depth) % 1) + 1) % 1 * W;
+      var y = (((s.v - elv * depth * 0.55) % 1) + 1) % 1 * H;
+      var tw = 0.7 + 0.3 * Math.sin(t * 0.0012 * s.tw + s.ph);
+      sctx.globalAlpha = s.a * tw;
+      sctx.fillStyle = s.layer === 2 ? '#dce7ff' : '#aebbdd';
+      sctx.beginPath(); sctx.arc(x, y, s.r, 0, 6.283); sctx.fill();
+    }
+    sctx.globalAlpha = 1;
+  }
+
+  // ------------------------------------------------------------------ bloom
+  function drawGlow(cam) {
+    gctx.clearRect(0, 0, W, H);
+    gctx.globalCompositeOperation = 'lighter';
+    var data = graph.graphData().nodes;
+    // camera forward ~ towards graph centre; used to cull nodes behind us
+    var fx = -cam.x, fy = -cam.y, fz = -cam.z;
+    // px per world-unit at distance 1, so bloom stays proportional at any zoom
+    var c3 = graph.camera();
+    var projK = (H / 2) / Math.tan(((c3 && c3.fov ? c3.fov : 50) * Math.PI / 180) / 2);
+
+    for (var i = 0; i < data.length; i++) {
+      var n = data[i];
+      if (n.x === undefined) continue;
+      var dx = n.x - cam.x, dy = n.y - cam.y, dz = n.z - cam.z;
+      if (dx * fx + dy * fy + dz * fz <= 0) continue;      // behind camera
+      var dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+      var p = graph.graph2ScreenCoords(n.x, n.y, n.z);
+      if (!p || !isFinite(p.x) || !isFinite(p.y)) continue;
+      if (p.x < -220 || p.x > W + 220 || p.y < -220 || p.y > H + 220) continue;
+
+      var strength = anyLit() ? (isLit(n.id) ? 1 : 0.08) : 0.62;
+      if (strength < 0.02) continue;
+
+      var worldR = 3.8 * Math.cbrt(1.6 + (n.degree || 0) * 0.22);
+      var screenR = (worldR * projK) / Math.max(dist, 1);
+      var radius = Math.max(5, Math.min(180, screenR * 3.0));
+      var alpha = Math.min(0.34, 0.09 + screenR * 0.011) * strength;
+
+      var c = rgb(nodeColor(n));
+      var rg = gctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, radius);
+      rg.addColorStop(0, 'rgba(' + c + ',' + (alpha * 0.95).toFixed(3) + ')');
+      rg.addColorStop(0.32, 'rgba(' + c + ',' + (alpha * 0.34).toFixed(3) + ')');
+      rg.addColorStop(1, 'rgba(' + c + ',0)');
+      gctx.fillStyle = rg;
+      gctx.beginPath(); gctx.arc(p.x, p.y, radius, 0, 6.283); gctx.fill();
+    }
+    gctx.globalCompositeOperation = 'source-over';
+  }
+
+  // -------------------------------------------------------- animation loop
+  var angle = Math.PI * 0.25;
+  var last = 0;
+  var busyUntil = 0;        // idle rotation must not fight a camera tween
+  var ORBIT_RATE = (Math.PI * 2) / 210000;   // one full orbit ~3.5 min, wall-clock
+
+  function tick(t) {
+    var dt = last ? Math.min(t - last, 100) : 16;   // clamp after tab-switches
+    last = t;
+    var cam = graph.cameraPosition();
+
+    if (idle && focused === null && t > busyUntil) {
+      var r = Math.hypot(cam.x, cam.z) || 520;
+      angle += ORBIT_RATE * dt;
+      graph.cameraPosition({ x: r * Math.sin(angle), y: cam.y, z: r * Math.cos(angle) });
+      cam = graph.cameraPosition();
+    } else {
+      angle = Math.atan2(cam.x, cam.z);
+    }
+
+    drawStars(t, cam);
+    drawGlow(cam);
+    requestAnimationFrame(tick);
+  }
+
+  // ------------------------------------------------------------ side panel
+  var panel = document.getElementById('panel');
+
+  function select(id, fly) {
+    var n = byId[id];
+    if (!n) return;
+    focused = id;
+    idle = false;
+    recomputeLit();
+    refresh();
+
+    if (fly !== false) {
+      var live = graph.graphData().nodes.filter(function (d) { return d.id === id; })[0];
+      if (live && live.x !== undefined) {
+        var d = Math.hypot(live.x, live.y, live.z);
+        var ratio = d > 0 ? 1 + 120 / d : 1;
+        graph.cameraPosition(
+          d > 0 ? { x: live.x * ratio, y: live.y * ratio, z: live.z * ratio }
+                : { x: 0, y: 0, z: 130 },
+          live, 1300
+        );
+      }
+    }
+
+    var c = nodeColor(n);
+    document.getElementById('pgrp').textContent = n.group;
+    panel.querySelector('.grp').style.color = c;
+    document.getElementById('ptitle').textContent = n.label;
+    document.getElementById('ppath').textContent = n.path;
+    document.getElementById('pexcerpt').textContent = n.excerpt || '(no text)';
+
+    var nb = neighbours[id].slice().sort(function (a, b) {
+      return (byId[b].degree || 0) - (byId[a].degree || 0);
+    });
+    var wrap = document.getElementById('pnbwrap');
+    var box = document.getElementById('pnb');
+    box.innerHTML = '';
+    wrap.hidden = nb.length === 0;
+    var CHIP_CAP = 24;
+    var shown = nb.slice(0, CHIP_CAP);
+    shown.forEach(function (oid) {
+      var b = document.createElement('button');
+      b.textContent = byId[oid].label;
+      b.style.borderColor = 'rgba(' + rgb(nodeColor(byId[oid])) + ',0.42)';
+      b.onclick = function () { select(oid, true); };
+      box.appendChild(b);
+    });
+    if (nb.length > CHIP_CAP) {
+      var more = document.createElement('button');
+      var rest = nb.slice(CHIP_CAP);
+      more.textContent = '+' + rest.length + ' more';
+      more.style.opacity = '.7';
+      more.onclick = function () {
+        more.remove();
+        rest.forEach(function (oid) {
+          var b = document.createElement('button');
+          b.textContent = byId[oid].label;
+          b.style.borderColor = 'rgba(' + rgb(nodeColor(byId[oid])) + ',0.42)';
+          b.onclick = function () { select(oid, true); };
+          box.appendChild(b);
+        });
+      };
+      box.appendChild(more);
+    }
+
+    panel.classList.add('open');
+  }
+
+  function clearFocus() {
+    focused = null; citedIds = [];
+    recomputeLit(); refresh();
+    panel.classList.remove('open');
+    nudgeIdle();
+  }
+  document.getElementById('close').onclick = clearFocus;
+
+  // ---------------------------------------------------------------- legend
+  var legend = document.getElementById('legend');
+  var counts = {};
+  GRAPH.nodes.forEach(function (n) { counts[n.group] = (counts[n.group] || 0) + 1; });
+  groups.forEach(function (g) {
+    var b = document.createElement('button');
+    b.innerHTML = '<span class="dot" style="color:' + colorOf[g] + ';background:' + colorOf[g] + '"></span>' +
+                  '<span>' + g + '</span> <span class="n">' + counts[g] + '</span>';
+    b.onclick = function () {
+      // light the whole group
+      focused = null;
+      citedIds = GRAPH.nodes.filter(function (n) { return n.group === g; })
+                            .map(function (n) { return n.id; });
+      recomputeLit(); refresh();
+      Array.prototype.forEach.call(legend.children, function (c) { c.classList.remove('on'); });
+      b.classList.add('on');
+    };
+    legend.appendChild(b);
+  });
+
+  document.getElementById('hudsub').textContent =
+    GRAPH.nodes.length + ' notes · ' + GRAPH.links.length + ' connections';
+
+  // ------------------------------------------------------------------ chat
+  var form = document.getElementById('bar');
+  var input = document.getElementById('q');
+  var sendBtn = document.getElementById('send');
+  var answer = document.getElementById('answer');
+
+  function showAnswer(html, isErr) {
+    answer.className = isErr ? 'err show' : 'show';
+    answer.innerHTML = html;
+  }
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (m) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m];
+    });
+  }
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var q = input.value.trim();
+    if (!q) return;
+    sendBtn.disabled = true;
+    showAnswer('<span class="dots"><i></i><i></i><i></i></span>', false);
+
+    fetch('/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: q })
+    })
+      .then(function (r) {
+        return r.json().catch(function () { return { error: 'Server returned a non-JSON response (HTTP ' + r.status + ').' }; })
+          .then(function (j) { return { ok: r.ok, body: j }; });
+      })
+      .then(function (res) {
+        if (!res.ok || res.body.error) {
+          showAnswer(esc(res.body.error || 'Request failed.'), true);
+          return;
+        }
+        var ids = (res.body.nodes || []).filter(function (i) { return byId[i]; });
+        var html = esc(res.body.answer || '(empty answer)');
+        if (ids.length) {
+          html += '<div class="cites"><span>From</span>' + ids.map(function (i) {
+            return '<button data-id="' + i + '">' + esc(byId[i].label) + '</button>';
+          }).join('') + '</div>';
+        }
+        showAnswer(html, false);
+
+        focused = null;
+        citedIds = ids;
+        recomputeLit(); refresh();
+        if (ids.length) { idle = false; select(ids[0], true); }
+
+        Array.prototype.forEach.call(answer.querySelectorAll('.cites button'), function (b) {
+          b.onclick = function () { select(parseInt(b.dataset.id, 10), true); };
+        });
+      })
+      .catch(function (err) {
+        showAnswer('Could not reach the server: ' + esc(err.message), true);
+      })
+      .then(function () {
+        sendBtn.disabled = false;
+        input.select();
+      });
+  });
+
+  // ------------------------------------------------------------------ boot
+  // Frame the dense core rather than the full bounding sphere: a handful of
+  // barely-linked notes drift far out, and fitting them shrinks everything else.
+  function frame(ms) {
+    var ns = graph.graphData().nodes.filter(function (n) { return isFinite(n.x); });
+    if (!ns.length) return;
+    var cx = 0, cy = 0, cz = 0;
+    ns.forEach(function (n) { cx += n.x; cy += n.y; cz += n.z; });
+    cx /= ns.length; cy /= ns.length; cz /= ns.length;
+
+    var rads = ns.map(function (n) {
+      return Math.hypot(n.x - cx, n.y - cy, n.z - cz);
+    }).sort(function (a, b) { return a - b; });
+    var core = rads[Math.floor(rads.length * 0.85)] || 220;
+
+    var c3 = graph.camera();
+    var fov = ((c3 && c3.fov ? c3.fov : 50) * Math.PI) / 180;
+    var dist = Math.max(180, (core * 1.6) / Math.tan(fov / 2));
+
+    var cam = graph.cameraPosition();
+    var d = Math.hypot(cam.x - cx, cam.y - cy, cam.z - cz) || 1;
+    var k = dist / d;
+    ms = ms === undefined ? 1200 : ms;
+    busyUntil = performance.now() + ms + 260;
+    graph.cameraPosition({
+      x: cx + (cam.x - cx) * k,
+      y: cy + (cam.y - cy) * k,
+      z: cz + (cam.z - cz) * k
+    }, { x: cx, y: cy, z: cz }, ms);
+  }
+  graph.onEngineStop(function () { boot.classList.add('gone'); frame(); });
+  setTimeout(function () { boot.classList.add('gone'); }, 4000);
+  setTimeout(frame, 3500);
+  setTimeout(frame, 7000);
+  requestAnimationFrame(tick);
+
+  window.__galaxy = { graph: graph, select: select, groups: groups };
+})();
