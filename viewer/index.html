@@ -66,7 +66,10 @@
   #panel .grp .dot{width:7px;height:7px;border-radius:50%;box-shadow:0 0 9px currentColor}
   #panel h3{margin:11px 0 6px;font-size:21px;font-weight:600;line-height:1.25;letter-spacing:-.01em;word-break:break-word}
   #panel .path{font-size:11px;color:var(--dim);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
-  #panel .body{padding:22px 26px 30px;overflow-y:auto;flex:1}
+  /* min-height:0 is required: without it a flex child refuses to shrink below
+     its content, so on short viewports the excerpt overflows instead of
+     scrolling and collides with the section below it. */
+  #panel .body{padding:22px 26px 30px;overflow-y:auto;flex:1;min-height:0}
   #panel .body h4{margin:0 0 10px;font-size:10.5px;letter-spacing:.2em;text-transform:uppercase;color:var(--dim);font-weight:600}
   #panel .excerpt{margin:0 0 28px;color:#c6cfe4;font-size:13.5px;line-height:1.72}
   #panel .links{display:flex;flex-wrap:wrap;gap:7px}

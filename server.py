@@ -38,11 +38,59 @@ PLACEHOLDER_KEYS = {"", "PUT-YOUR-KEY-HERE", "YOUR-KEY-HERE", "sk-...", None}
 
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 
-SYSTEM_PROMPT = (
+# --- grounding ---------------------------------------------------------
+# Whether a question is ABOUT the notes is decided here, before the client is
+# told anything, because this is the only place that can see retrieval scores.
+# A question that is not grounded comes back with nodes: [] and grounded: false,
+# so the viewer physically cannot fly the camera on small talk.
+#
+# Measured against this note set: small talk ("good morning", "tell me a joke",
+# "what's up") tops out around 2.8; real questions start around 6.3. 4.5 sits
+# in the gap. Raise it if chit-chat starts moving the camera; lower it if real
+# questions get turned away.
+GROUNDING_MIN_SCORE = 4.5
+
+# A cited note must score at least this fraction of the best match. Without it
+# every question returns a full six, the answer rests on four weak notes it
+# never really used, and the viewer can never justify a dive to a single note.
+SOURCE_RATIO = 0.5
+SMALL_TALK_MAX_WORDS = 6          # anything longer is treated as a real ask
+
+# Filler acknowledgements, allowed to appear in short runs ("ok cool", "haha nice").
+_FILLER = (r"ok|okay|kk|cool|nice|great|awesome|lovely|perfect|sweet|haha|hah"
+           r"|lol|hmm+|wow|right|sure|yep|yeah|yes|nope|fine|indeed|noted"
+           r"|thanks|thanx|thank\s+you|cheers|ta|bye|goodbye")
+
+SMALL_TALK_RE = re.compile((r"""^(?:
+      (?:good\s+)?(?:morning|afternoon|evening|night|day)
+    | (?:hi|hey|hello|howdy|yo|hiya)(?:\s+there|\s+galaxy)?
+    | how(?:'?s|\s+is|\s+are)\s+(?:it\s+going|you|things|tricks)
+    | what'?s\s+up
+    | (?:many\s+)?thanks|thank\s+you|cheers|ta
+    | (?:%(f)s)(?:\s+(?:%(f)s)){0,3}
+    | who\s+are\s+you|what\s+are\s+you|what\s+can\s+you\s+do
+    | tell\s+me\s+a\s+joke|say\s+something|make\s+me\s+laugh
+    | are\s+you\s+(?:there|awake|alive|ok|okay)
+    | (?:good)?bye|see\s+you|later|night\s+night
+    | sorry|please|never\s*mind|forget\s+it
+  )[\s!.?,]*$""" % {"f": _FILLER}), re.X | re.I)
+
+NOTES_SYSTEM_PROMPT = (
     "You are the mind behind a personal knowledge base. Answer ONLY from the "
     "notes provided below. Do not use outside knowledge and do not guess. "
-    "Answer in two or three sentences. If the notes do not cover the question, "
-    "say so plainly and do not invent an answer."
+    "Answer in two or three sentences. Do NOT quote the notes at length or "
+    "recite their contents -- the reader already has the note open on screen, "
+    "so summarise in your own words and keep it short. If the notes do not "
+    "cover the question, say so plainly and do not invent an answer."
+)
+
+ASIDE_SYSTEM_PROMPT = (
+    "You are the voice of a personal knowledge galaxy. The message below is NOT "
+    "answerable from the user's notes. If it is small talk, a greeting or an "
+    "acknowledgement, reply with one short, warm sentence and do not mention "
+    "notes at all. If it is a genuine question, say in one plain sentence that "
+    "their notes do not cover it. Never invent note content, never list "
+    "anything, and never exceed one sentence."
 )
 
 STOPWORDS = set("""
@@ -100,7 +148,8 @@ def load_notes(force=False):
 # ------------------------------------------------------------------ scoring
 
 def rank(question, notes, k=TOP_K):
-    """Keyword overlap; title matches weigh more than body matches."""
+    """Keyword overlap; title matches weigh more than body matches.
+    Returns the top k as (score, note) pairs, best first."""
     q_tokens = tokenize(question)
     if not q_tokens:
         return []
@@ -125,7 +174,45 @@ def rank(question, notes, k=TOP_K):
             scored.append((score, n))
 
     scored.sort(key=lambda p: (-p[0], p[1]["id"]))
-    return [n for _, n in scored[:k]]
+    return scored[:k]
+
+
+def is_small_talk(question):
+    """Greetings, thanks, jokes -- anything that is chat rather than a query.
+    Only short utterances qualify; a long sentence is a real ask."""
+    t = re.sub(r"[^a-z0-9'\s]", " ", question.lower())
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t:
+        return True
+    if len(t.split()) > SMALL_TALK_MAX_WORDS:
+        return False
+    return bool(SMALL_TALK_RE.match(t))
+
+
+def classify(question, notes):
+    """Decide what kind of message this is BEFORE anything is retrieved or
+    rendered. Returns (intent, hits):
+
+      "notes"  a genuine question with real support in the notes -- cite and fly
+      "aside"  everything else: small talk, or a question the notes do not
+               cover. Both carry no node indexes, so the camera holds still.
+
+    Separating small talk from an out-of-scope question is left to the model,
+    which is far better at it than a keyword score -- and it changes only the
+    wording of the reply, never whether the galaxy moves.
+    """
+    if is_small_talk(question):
+        return "aside", []
+
+    scored = rank(question, notes)
+    if not scored or scored[0][0] < GROUNDING_MIN_SCORE:
+        return "aside", []
+
+    # Keep only the notes that genuinely support the answer. These are both
+    # what the model is shown and what the viewer is told to light, so the
+    # citation is the truth rather than a top-six leaderboard.
+    cutoff = scored[0][0] * SOURCE_RATIO
+    return "notes", [n for sc, n in scored if sc >= cutoff]
 
 
 def build_context(hits):
@@ -205,31 +292,44 @@ def answer_question(question):
     if not notes:
         raise ChatError("No note index found. Run `python3 build.py` first.")
 
-    # Rank first: if nothing matches we can answer honestly without an API call.
-    hits = rank(question, notes)
-    if not hits:
-        return ("None of your notes mention anything close to that, so I can't "
-                "answer it from them.", [])
+    # Classify first. Only a "notes" verdict is allowed to return node indexes,
+    # so small talk can never reach the camera no matter what the client does.
+    intent, hits = classify(question, notes)
+
+    if intent == "aside":
+        try:
+            key, model = load_config()
+        except ChatError:
+            # No key configured: still answer honestly rather than erroring out.
+            return ("I can only answer from your notes, and that one isn't in "
+                    "them.", [], False)
+        reply = call_openai(key, model, _messages(ASIDE_SYSTEM_PROMPT, question))
+        _remember(question, reply)
+        return reply, [], False
 
     key, model = load_config()
 
-    context = build_context(hits)
+    reply = call_openai(key, model, _messages(
+        NOTES_SYSTEM_PROMPT, "NOTES:\n%s\n\nQUESTION: %s"
+        % (build_context(hits), question)))
+    _remember(question, reply)
+    return reply, [n["id"] for n in hits], True
+
+
+def _messages(system, user):
     with _lock:
         history = list(_history)
+    msgs = [{"role": "system", "content": system}]
+    msgs.extend(history)
+    msgs.append({"role": "user", "content": user})
+    return msgs
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.extend(history)
-    messages.append({"role": "user", "content":
-                     "NOTES:\n%s\n\nQUESTION: %s" % (context, question)})
 
-    reply = call_openai(key, model, messages)
-
+def _remember(question, reply):
     with _lock:
         _history.append({"role": "user", "content": question})
         _history.append({"role": "assistant", "content": reply})
         del _history[:max(0, len(_history) - HISTORY_TURNS * 2)]
-
-    return reply, [n["id"] for n in hits]
 
 
 # ------------------------------------------------------------------ handler
@@ -273,14 +373,17 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json(400, {"error": "Ask a question first."})
 
         try:
-            answer, ids = answer_question(question)
+            answer, ids, grounded = answer_question(question)
         except ChatError as exc:
             return self._json(exc.status, {"error": exc.message})
         except Exception as exc:                      # never 500 with a stack trace
             sys.stderr.write("chat failed: %r\n" % (exc,))
             return self._json(500, {"error": "Unexpected server error: %s" % exc})
 
-        return self._json(200, {"answer": answer, "nodes": ids})
+        # grounded == False always ships an empty nodes list: the viewer is
+        # given nothing to fly to, rather than being trusted not to.
+        return self._json(200, {"answer": answer, "nodes": ids,
+                                "grounded": bool(grounded)})
 
     def end_headers(self):
         self.send_header("X-Content-Type-Options", "nosniff")

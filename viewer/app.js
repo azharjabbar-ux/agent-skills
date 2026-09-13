@@ -23,6 +23,15 @@
   // immediately and stop whatever is being spoken.
   var INTERRUPT_WORDS = ['stop', 'wait', 'cancel', 'quiet', 'shush', 'hold on', 'never mind'];
 
+  /* An answer resting on this many notes or fewer earns a dive to its top
+     source. Above it, flying to one note out of six would be a claim the
+     answer cannot support, so the whole cluster lights and the camera holds. */
+  var FLY_MAX_SOURCES = 3;
+
+  /* The note is on screen to be read. The voice only ever gets the short
+     answer, and never more than this much of it. */
+  var SPEAK_MAX_CHARS = 420;
+
   var boot = document.getElementById('boot');
   var booterr = document.getElementById('booterr');
 
@@ -284,6 +293,7 @@
   function select(id, fly) {
     var n = byId[id];
     if (!n) return;
+    frameLocked = true;
     focused = id;
     idle = false;
     recomputeLit();
@@ -398,6 +408,7 @@
   function ask(q) {
     q = String(q || '').trim();
     if (!q || sendBtn.disabled) return;
+    frameLocked = true;          // the camera is the answer's from here on
     input.value = q;
     sendBtn.disabled = true;
     setStatus('thinking');
@@ -420,24 +431,41 @@
           return;
         }
         var ids = (res.body.nodes || []).filter(function (i) { return byId[i]; });
+        // The server decides whether this was a question about the notes. It
+        // sends grounded:false with an empty nodes list for small talk, so the
+        // camera cannot be moved by anything that was not really a question.
+        var grounded = res.body.grounded === true && ids.length > 0;
+
         var html = esc(res.body.answer || '(empty answer)');
-        if (ids.length) {
+        if (grounded) {
           html += '<div class="cites"><span>From</span>' + ids.map(function (i) {
             return '<button data-id="' + i + '">' + esc(byId[i].label) + '</button>';
           }).join('') + '</div>';
         }
         showAnswer(html, false);
 
-        focused = null;
-        citedIds = ids;
-        recomputeLit(); refresh();
-        if (ids.length) { idle = false; select(ids[0], true); }
+        if (grounded) {
+          focused = null;
+          citedIds = ids;
+          if (ids.length <= FLY_MAX_SOURCES) {
+            // Dive to the note the answer leans on hardest, light it and its
+            // neighbours, open its panel -- all while the answer is spoken.
+            idle = false;
+            select(ids[0], true);
+          } else {
+            // Too many sources to point at one. Light the constellation and
+            // leave the camera exactly where it is.
+            recomputeLit(); refresh();
+            panel.classList.remove('open');
+          }
+        }
+        // Not grounded: the graph is not touched at all. It holds still.
 
         Array.prototype.forEach.call(answer.querySelectorAll('.cites button'), function (b) {
           b.onclick = function () { select(parseInt(b.dataset.id, 10), true); };
         });
 
-        speak(res.body.answer || '');
+        speak(res.body.answer || '');   // the answer only -- never the excerpt
       })
       .catch(function (err) {
         var msg = 'Could not reach the server: ' + err.message;
@@ -544,6 +572,11 @@
     if (!synth || !audioUnlocked) return;    // never before the first gesture
     text = String(text || '').trim();
     if (!text) return;
+    if (text.length > SPEAK_MAX_CHARS) {          // never recite, never ramble
+      var cut = text.slice(0, SPEAK_MAX_CHARS);
+      var stop = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('! '), cut.lastIndexOf('? '));
+      text = (stop > SPEAK_MAX_CHARS * 0.5 ? cut.slice(0, stop + 1) : cut).trim();
+    }
 
     try { synth.cancel(); } catch (e) {}
     var u = new SpeechSynthesisUtterance(text);
@@ -705,6 +738,16 @@
   // ------------------------------------------------------------------ boot
   // Frame the dense core rather than the full bounding sphere: a handful of
   // barely-linked notes drift far out, and fitting them shrinks everything else.
+  var frameLocked = false;   // set the moment the user engages; see autoFrame()
+
+  /* Auto-framing exists to settle the opening shot. Re-lighting the graph
+     restarts the force engine, so onEngineStop can fire long after load --
+     without this lock the camera would re-frame itself mid-answer and throw
+     away a dive the user is watching. */
+  function autoFrame() {
+    if (!frameLocked) frame();
+  }
+
   function frame(ms) {
     var ns = graph.graphData().nodes.filter(function (n) { return isFinite(n.x); });
     if (!ns.length) return;
@@ -732,10 +775,10 @@
       z: cz + (cam.z - cz) * k
     }, { x: cx, y: cy, z: cz }, ms);
   }
-  graph.onEngineStop(function () { boot.classList.add('gone'); frame(); });
+  graph.onEngineStop(function () { boot.classList.add('gone'); autoFrame(); });
   setTimeout(function () { boot.classList.add('gone'); }, 4000);
-  setTimeout(frame, 3500);
-  setTimeout(frame, 7000);
+  setTimeout(autoFrame, 3500);
+  setTimeout(autoFrame, 7000);
   requestAnimationFrame(tick);
 
   window.__galaxy = {
@@ -752,6 +795,15 @@
       unlock: unlockAudio,
       isUnlocked: function () { return audioUnlocked; },
       hasRecognition: !!SR,
+      state: function () {
+        return {
+          focused: focused, cited: citedIds.slice(),
+          panelOpen: document.getElementById('panel').classList.contains('open'),
+          panelTitle: document.getElementById('ptitle').textContent,
+          cam: graph.cameraPosition()
+        };
+      },
+      FLY_MAX_SOURCES: FLY_MAX_SOURCES,
       voiceName: function () {
         return chosenVoice ? chosenVoice.name + ' (' + chosenVoice.lang + ')' : null;
       },
