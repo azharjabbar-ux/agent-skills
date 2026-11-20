@@ -1,0 +1,4 @@
+{
+  "openai_api_key": "PUT-YOUR-KEY-HERE",
+  "model": "gpt-6-astra"
+}

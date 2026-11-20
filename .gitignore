@@ -7,3 +7,10 @@ node_modules/
 .claude/sdd-cache/
 evals/results/
 __pycache__/
+
+# Knowledge Galaxy
+# config.json holds a real API key once you fill it in - never commit it.
+config.json
+# Regenerate these with: python3 build.py
+viewer/graph-data.js
+notes-index.json
