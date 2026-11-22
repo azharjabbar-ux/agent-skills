@@ -407,11 +407,6 @@
       "family": "nouns"
     },
     {
-      "find": "landscape",
-      "replace": "market",
-      "family": "nouns"
-    },
-    {
       "find": "journey",
       "replace": "process",
       "family": "nouns"
@@ -439,11 +434,6 @@
     {
       "find": "synergy",
       "replace": "overlap",
-      "family": "nouns"
-    },
-    {
-      "find": "ecosystem",
-      "replace": "system",
       "family": "nouns"
     },
     {
